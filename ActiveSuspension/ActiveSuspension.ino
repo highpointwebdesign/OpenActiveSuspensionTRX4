@@ -1,227 +1,245 @@
+#include <MPU6050.h>
+#include <ESP32Servo.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Wire.h>
-#include <ESP32Servo.h>
+#include <WebSocketsServer.h>
 
+MPU6050 mpu;
+Servo frontLeftServo, frontRightServo, rearLeftServo, rearRightServo;
 Preferences preferences;
-#define LED_BUILTIN 2
-
+// Create a web server object that listens on port 80
 WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
 
-// Function prototypes
-void readSettings();
-void setupWiFi();
-void setupServer();
-void setupMPU6050();
-double gc(uint8_t address);
-void w(uint8_t address, uint8_t value);
-void wa(int d[]);
-void flashLED(int flashes);
+// Network credentials
+  //  Station
+  const char* ssidSTA = "YOURNETWORK";
+  const char* passwordSTA = "YOURPASSWORD";
+  // Access Point
+  const char* ssidAP = "ACCESSPOINT";
+  const char* passwordAP = "ACCESSPOINTPASSWORD";
 
-Servo fl, fr, rl, rr;
-
-void flashLED(int flashes) {
-  // for (int i = 0; i < flashes; i++) {
-  //   digitalWrite(LED_BUILTIN, HIGH);
-  //   delay(500);
-  //   digitalWrite(LED_BUILTIN, LOW);
-  //   delay(500);
-  // }
-  
-}
+//  variable declarations
+  int midPoint = 90;
+  float multiplier = 1.0;
+  float balance = 0.0;
+  int rangeMin = 0;
+  int rangeMax = 180;
+  int reactionSpeed = 100;
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
 
-  preferences.begin("settings", false);
+// Initialize serial communication
+ Serial.begin(115200);
+ delay(1000);
 
-  readSettings();
-  setupWiFi();
-  setupServer();
-  setupMPU6050();
+//  GPIO Designation
+ frontLeftServo.attach(13);
+ frontRightServo.attach(12);
+ rearLeftServo.attach(14);
+ rearRightServo.attach(27);
+
+ preferences.begin("suspension", false);
+ midPoint = preferences.getInt("midPoint", 90);
+ multiplier = preferences.getFloat("multiplier", 1.0);
+ balance = preferences.getFloat("balance", 0.0);
+ rangeMin = preferences.getInt("rangeMin", 0);
+ rangeMax = preferences.getInt("rangeMax", 180);
+ reactionSpeed = preferences.getInt("reactionSpeed", 100);
+
+ // Set up WiFi as Access Point
+ WiFi.mode(WIFI_AP_STA);
+ WiFi.softAP(ssidAP, passwordAP);
+
+ // Print the IP address of the AP
+ IPAddress apIP = WiFi.softAPIP();
+ Serial.print("AP IP address: ");
+ Serial.println(apIP);
+
+ // Setting up STA mode
+ WiFi.begin(ssidSTA, passwordSTA);
+
+ // Wait for STA connection
+ Serial.println("Connecting to WiFi.");
+ while (WiFi.status() != WL_CONNECTED) {
+  delay(1000);
+  Serial.println(".");
+ }
+ // Output STA IP address and hostname
+ Serial.print("Connected to WiFi. IP address: ");
+ Serial.println(WiFi.localIP());
+ Serial.print("Hostname: ");
+ Serial.println(WiFi.getHostname());
+
+ // Define the root path handling function
+ server.on("/", handleRoot);
+ server.begin();
+ Serial.println("HTTP server started");
+
+ webSocket.begin();
+ webSocket.onEvent(webSocketEvent);
+ Serial.println("WebSocket server started");
 }
 
 void loop() {
-  server.handleClient();
-
-  double acx = gc(0x3b) - preferences.getFloat("vs_X_CAL", 0.0);
-  double acy = gc(0x3d) - preferences.getFloat("vs_Y_CAL", 0.0);
-  double acz = gc(0x3f) - preferences.getFloat("vs_Z_CAL", 0.0);
-
-  Serial.print(acx);
-  Serial.print("   ");
-  Serial.print(acy);
-  Serial.print("   ");
-  Serial.print(acz);
-  Serial.println();
-
-  int d[4];
-  d[0] = preferences.getInt("vs_SERVO_MID", 90) + (-acz + acy) * preferences.getInt("vs_SCALE", 10);
-  d[1] = preferences.getInt("vs_SERVO_MID", 90) + (acz + acy) * preferences.getInt("vs_SCALE", 10);
-  d[2] = preferences.getInt("vs_SERVO_MID", 90) + (-acz - acy) * preferences.getInt("vs_SCALE", 10);
-  d[3] = preferences.getInt("vs_SERVO_MID", 90) + (acz - acy) * preferences.getInt("vs_SCALE", 10);
-
-  wa(d);
-  delay(10);
+ // Handle client requests
+ server.handleClient();
+ webSocket.loop();
 }
 
-void readSettings() {
-  Serial.println("Settings read from Preferences:");
-  Serial.printf("vs_rideheight = %.1f\n", preferences.getFloat("vs_rideheight", 1.0));
-  Serial.printf("vs_multiplier = %.1f\n", preferences.getFloat("vs_multiplier", 1.0));
-  Serial.printf("vs_balance = %.1f\n", preferences.getFloat("vs_balance", 0.0));
-  Serial.printf("vs_range = %.1f\n", preferences.getFloat("vs_range", 0.0));
-  Serial.printf("vs_speed = %.1f\n", preferences.getFloat("vs_speed", 1.5));
-  Serial.printf("vs_damping = %.1f\n", preferences.getFloat("vs_damping", 2.0));
-  Serial.printf("vs_SCALE = %d\n", preferences.getInt("vs_SCALE", 10));
-  Serial.printf("vs_SERVO_MIN = %d\n", preferences.getInt("vs_SERVO_MIN", 70));
-  Serial.printf("vs_SERVO_MAX = %d\n", preferences.getInt("vs_SERVO_MAX", 110));
-  Serial.printf("vs_SERVO_MID = %d\n", preferences.getInt("vs_SERVO_MID", 90));
-  Serial.printf("vs_SERVO_DIFF = %d\n", preferences.getInt("vs_SERVO_DIFF", 0));
-  Serial.printf("vs_X_CAL = %.1f\n", preferences.getFloat("vs_X_CAL", 0.0));
-  Serial.printf("vs_Y_CAL = %.1f\n", preferences.getFloat("vs_Y_CAL", 0.0));
-  Serial.printf("vs_Z_CAL = %.1f\n", preferences.getFloat("vs_Z_CAL", 0.0));
-
-  flashLED(1);
+void handleRoot() {
+ String html = "<html><body>";
+ html += "<h1>Suspension Control</h1>";
+ html += "<form>";
+ html += "Mid Point: <button onclick=\"updateValue('midPoint', -1)\" id=\"decrementMidPoint\">-</button>";
+ html += "<input type=\"text\" id=\"midPoint\" value=\"" + String(midPoint) + "\" readonly>";
+ html += "<button onclick=\"updateValue('midPoint', 1)\" id=\"incrementMidPoint\">+</button><br>";
+ html += "Multiplier: <button onclick=\"updateValue('multiplier', -0.05)\" id=\"decrementMultiplier\">-</button>";
+ html += "<input type=\"text\" id=\"multiplier\" value=\"" + String(multiplier) + "\" readonly>";
+ html += "<button onclick=\"updateValue('multiplier', 0.05)\" id=\"incrementMultiplier\">+</button><br>";
+ html += "Balance: <button onclick=\"updateValue('balance', -0.1)\" id=\"decrementBalance\">-</button>";
+ html += "<input type=\"text\" id=\"balance\" value=\"" + String(balance) + "\" readonly>";
+ html += "<button onclick=\"updateValue('balance', 0.1)\" id=\"incrementBalance\">+</button><br>";
+ html += "Range Min: <button onclick=\"updateValue('rangeMin', -1)\" id=\"decrementRangeMin\">-</button>";
+ html += "<input type=\"text\" id=\"rangeMin\" value=\"" + String(rangeMin) + "\" readonly>";
+ html += "<button onclick=\"updateValue('rangeMin', 1)\" id=\"incrementRangeMin\">+</button><br>";
+ html += "Range Max: <button onclick=\"updateValue('rangeMax', -1)\" id=\"decrementRangeMax\">-</button>";
+ html += "<input type=\"text\" id=\"rangeMax\" value=\"" + String(rangeMax) + "\" readonly>";
+ html += "<button onclick=\"updateValue('rangeMax', 1)\" id=\"incrementRangeMax\">+</button><br>";
+ html += "Reaction Speed: <button onclick=\"updateValue('reactionSpeed', -10)\" id=\"decrementReactionSpeed\">-</button>";
+ html += "<input type=\"text\" id=\"reactionSpeed\" value=\"" + String(reactionSpeed) + "\" readonly>";
+ html += "<button onclick=\"updateValue('reactionSpeed', 10)\" id=\"incrementReactionSpeed\">+</button><br>";
+ html += "</form>";
+ html += "<script>";
+ html += "var ws = new WebSocket('ws://' + location.hostname + ':81/');";
+ html += "ws.onmessage = function(event) {";
+ html += " var data = event.data.split(',');";
+ html += " data.forEach(function(item) {";
+ html += "  var pair = item.split(':');";
+ html += "  var element = document.getElementById(pair[0]);";
+ html += "  if (element) {";
+ html += "   element.value = pair[1];";
+ html += "   document.getElementById('decrement' + pair[0].charAt(0).toUpperCase() + pair[0].slice(1)).disabled = false;";
+ html += "   document.getElementById('increment' + pair[0].charAt(0).toUpperCase() + pair[0].slice(1)).disabled = false;";
+ html += "  } else {";
+ html += "   console.error('Element not found: ' + pair[0]);";
+ html += "  }";
+ html += " });";
+ html += "};";
+ html += "function updateValue(id, increment) {";
+ html += " var element = document.getElementById(id);";
+ html += " var newValue = parseFloat(element.value) + increment;";
+ html += " if (id === 'midPoint' || id === 'rangeMin' || id === 'rangeMax') {";
+ html += "  newValue = Math.max(0, Math.min(180, newValue));";
+ html += " } else if (id === 'multiplier') {";
+ html += "  newValue = Math.max(0.05, Math.min(2.0, newValue));";
+ html += " } else if (id === 'balance') {";
+ html += "  newValue = Math.max(-1.0, Math.min(1.0, newValue));";
+ html += " } else if (id === 'reactionSpeed') {";
+ html += "  newValue = Math.max(10, Math.min(200, newValue));";
+ html += " }";
+ html += " element.value = newValue.toFixed(2);";
+ html += " var message = id + ':' + newValue;";
+ html += " ws.send(message);";
+ html += " document.getElementById('decrement' + id.charAt(0).toUpperCase() + id.slice(1)).disabled = true;";
+ html += " document.getElementById('increment' + id.charAt(0).toUpperCase() + id.slice(1)).disabled = true;";
+ html += "}";
+ html += "</script>";
+ html += "</body></html>";
+ server.send(200, "text/html", html);
 }
 
-void setupWiFi() {
-  String STASSID = preferences.getString("adm_STASSID", "CAMELOT");
-  String STAPassword = preferences.getString("adm_STAPassword", "bluedaisy347");
 
-  WiFi.begin(STASSID.c_str(), STAPassword.c_str());
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-  }
-  Serial.print("Connected to ");
-  Serial.println(STASSID);
-  IPAddress localIP = WiFi.localIP();
-  Serial.print("IP Address: ");
-  Serial.println(localIP);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+ if (type == WStype_TEXT) {
+  String message = String((char *)payload);
+  Serial.print("Received message: ");
+  Serial.println(message);
 
-  // Update the IP address in preferences
-  preferences.putString("adm_ipaddress", localIP.toString());
-}
+  // Split the message into key-value pairs
+  int start = 0;
+  int end = message.indexOf(',');
 
-void setupServer() {
-  server.on("/data", HTTP_GET, [](){
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  while (end != -1) {
+   String pair = message.substring(start, end);
+   int delimiter = pair.indexOf(':');
+   String key = pair.substring(0, delimiter);
+   String value = pair.substring(delimiter + 1);
 
-    String json = "{";
-    json += "\"adm_STASSID\":\"" + preferences.getString("adm_STASSID", "CAMELOT") + "\",";
-    json += "\"adm_STAPassword\":\"" + preferences.getString("adm_STAPassword", "bluedaisy347") + "\",";
-    json += "\"adm_ipaddress\":\"" + preferences.getString("adm_ipaddress", "0.0.0.0") + "\",";
-    json += "\"vs_rideheight\":" + String(preferences.getFloat("vs_rideheight", 1.0)) + ",";
-    json += "\"vs_multiplier\":" + String(preferences.getFloat("vs_multiplier", 1.0)) + ",";
-    json += "\"vs_balance\":" + String(preferences.getFloat("vs_balance", 0.0)) + ",";
-    json += "\"vs_range\":" + String(preferences.getFloat("vs_range", 0.0)) + ",";
-    json += "\"vs_speed\":" + String(preferences.getFloat("vs_speed", 1.5)) + ",";
-    json += "\"vs_damping\":" + String(preferences.getFloat("vs_damping", 2.0)) + ",";
-    json += "\"vs_SCALE\":" + String(preferences.getInt("vs_SCALE", 10)) + ",";
-    json += "\"vs_SERVO_MIN\":" + String(preferences.getInt("vs_SERVO_MIN", 70)) + ",";
-    json += "\"vs_SERVO_MAX\":" + String(preferences.getInt("vs_SERVO_MAX", 110)) + ",";
-    json += "\"vs_SERVO_MID\":" + String(preferences.getInt("vs_SERVO_MID", 90)) + ",";
-    json += "\"vs_SERVO_DIFF\":" + String(preferences.getInt("vs_SERVO_DIFF", 0)) + ",";
-    json += "\"vs_X_CAL\":" + String(preferences.getFloat("vs_X_CAL", 0.0)) + ",";
-    json += "\"vs_Y_CAL\":" + String(preferences.getFloat("vs_Y_CAL", 0.0)) + ",";
-    json += "\"vs_Z_CAL\":" + String(preferences.getFloat("vs_Z_CAL", 0.0));
-    json += "}";
+   Serial.print("Received key: ");
+   Serial.print(key);
+   Serial.print(", value: ");
+   Serial.println(value);
 
-    server.send(200, "application/json", json);
-    flashLED(1);
-  });
+   if (key == "midPoint") {
+    midPoint = value.toInt();
+    preferences.putInt("midPoint", midPoint);
+    Serial.println("midPoint updated");
+   } else if (key == "multiplier") {
+    multiplier = value.toFloat();
+    preferences.putFloat("multiplier", multiplier);
+    Serial.println("multiplier updated");
+   } else if (key == "balance") {
+    balance = value.toFloat();
+    preferences.putFloat("balance", balance);
+    Serial.println("balance updated");
+   } else if (key == "rangeMin") {
+    rangeMin = value.toInt();
+    preferences.putInt("rangeMin", rangeMin);
+    Serial.println("rangeMin updated");
+   } else if (key == "rangeMax") {
+    rangeMax = value.toInt();
+    preferences.putInt("rangeMax", rangeMax);
+    Serial.println("rangeMax updated");
+   } else if (key == "reactionSpeed") {
+    reactionSpeed = value.toInt();
+    preferences.putInt("reactionSpeed", reactionSpeed);
+    Serial.println("reactionSpeed updated");
+   }
 
-  server.on("/update", HTTP_POST, [](){
-    server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-
-    if (server.hasArg("value")) {
-      String paramValue = server.arg("value");
-      int separatorIndex = paramValue.indexOf('=');
-      if (separatorIndex != -1) {
-        String setting = paramValue.substring(0, separatorIndex);
-        String value = paramValue.substring(separatorIndex + 1);
-        updateSetting(setting, value);
-        server.send(200, "application/json", "{\"message\":\"Setting updated successfully\"}");
-      } else {
-        server.send(400, "application/json", "{\"message\":\"Invalid setting format\"}");
-        flashLED(3);
-      }
-    } else {
-      server.send(400, "application/json", "{\"message\":\"No value parameter provided\"}");
-      flashLED(3);
-    }
-  });
-
-  server.begin();
-}
-
-void updateSetting(const String& setting, const String& value) {
-  if (setting.startsWith("vs_")) {
-    preferences.putFloat(setting.c_str(), value.toFloat());
-  } else {
-    preferences.putString(setting.c_str(), value);
+   start = end + 1;
+   end = message.indexOf(',', start);
   }
 
-  flashLED(1);
-}
+  // Handle the last key-value pair (or the only one if there is no comma)
+  String pair = message.substring(start);
+  int delimiter = pair.indexOf(':');
+  String key = pair.substring(0, delimiter);
+  String value = pair.substring(delimiter + 1);
 
-void setupMPU6050() {
-  Wire.begin();
-  w(0x6b, 0x00); // disable mpu6050 sleep
-  w(0x1c, 0b00001000); // maximum accelerometer resolution
-  w(0x1a, 0b00000110); // filter setup
+  Serial.print("Received key: ");
+  Serial.print(key);
+  Serial.print(", value: ");
+  Serial.println(value);
 
-  fl.attach(2);
-  fr.attach(3);
-  rl.attach(4);
-  rr.attach(5);
-}
-
-void w(uint8_t address, uint8_t value) {
-  Wire.beginTransmission(0x68);
-  Wire.write(address);
-  Wire.write(value);
-  Wire.endTransmission();
-}
-
-double gc(uint8_t address) {
-  Wire.beginTransmission(0x68);
-  Wire.write(address);
-  Wire.endTransmission();
-  Wire.requestFrom(0x68, 2);
-  return (Wire.read() << 8 | Wire.read()) / 819.2;
-}
-
-void wa(int d[]) {
-  d[0] = d[0] - preferences.getInt("vs_SERVO_DIFF", 0);
-  d[1] = d[1] + preferences.getInt("vs_SERVO_DIFF", 0);
-  d[2] = d[2] + preferences.getInt("vs_SERVO_DIFF", 0);
-  d[3] = d[3] - preferences.getInt("vs_SERVO_DIFF", 0);
-
-  for (int i = 0; i < 4; i++) {
-    if (d[i] < preferences.getInt("vs_SERVO_MIN", 70)) {
-      d[i] = preferences.getInt("vs_SERVO_MIN", 70);
-    } else if (d[i] > preferences.getInt("vs_SERVO_MAX", 110)) {
-      d[i] = preferences.getInt("vs_SERVO_MAX", 110);
-    }
+  if (key == "midPoint") {
+   midPoint = value.toInt();
+   preferences.putInt("midPoint", midPoint);
+   Serial.println("midPoint updated");
+  } else if (key == "multiplier") {
+   multiplier = value.toFloat();
+   preferences.putFloat("multiplier", multiplier);
+   Serial.println("multiplier updated");
+  } else if (key == "balance") {
+   balance = value.toFloat();
+   preferences.putFloat("balance", balance);
+   Serial.println("balance updated");
+  } else if (key == "rangeMin") {
+   rangeMin = value.toInt();
+   preferences.putInt("rangeMin", rangeMin);
+   Serial.println("rangeMin updated");
+  } else if (key == "rangeMax") {
+   rangeMax = value.toInt();
+   preferences.putInt("rangeMax", rangeMax);
+   Serial.println("rangeMax updated");
+  } else if (key == "reactionSpeed") {
+   reactionSpeed = value.toInt();
+   preferences.putInt("reactionSpeed", reactionSpeed);
+   Serial.println("reactionSpeed updated");
   }
 
-  d[0] = 180 - d[0];
-  d[1] = d[1];
-  d[2] = d[2];
-  d[3] = 180 - d[3];
-
-  rr.write(d[0]);
-  fr.write(d[1]);
-  rl.write(d[2]);
-  fl.write(d[3]);
+  // Broadcast the updated values to all connected clients
+  webSocket.broadcastTXT(message);
+ }
 }
-
-
