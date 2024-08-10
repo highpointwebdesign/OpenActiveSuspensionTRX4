@@ -76,8 +76,8 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(21), dmpDataReady, FALLING);
 
   // Wi-Fi setup
-  WiFi.softAP("ALVIN", "bluedaisy347");
-  Serial.println("WiFi AP started with SSID: ALVIN");
+  WiFi.softAP("SSID_OF_YOUR_CHOICE", "YOURPASSWORD");
+  Serial.println("WiFi AP started with SSID: SSID_OF_YOUR_CHOICE");
 
   // Global CORS configuration
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
