@@ -1,245 +1,239 @@
-#include <MPU6050.h>
-#include <ESP32Servo.h>
-#include <Preferences.h>
+#include <Wire.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <WebSocketsServer.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <Preferences.h>
+#include <ESP32Servo.h>
 
-MPU6050 mpu;
-Servo frontLeftServo, frontRightServo, rearLeftServo, rearRightServo;
-Preferences preferences;
-// Create a web server object that listens on port 80
-WebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
+#define SCALE 10 // servo "degrees" per newton
+#define SERVO_MIN 70
+#define SERVO_MAX 110
+#define SERVO_MID 90
+#define SERVO_DIFF 0
+#define ANGLE_THRESHOLD 2 // degrees
 
-// Network credentials
-  //  Station
-  const char* ssidSTA = "YOURNETWORK";
-  const char* passwordSTA = "YOURPASSWORD";
-  // Access Point
-  const char* ssidAP = "ACCESSPOINT";
-  const char* passwordAP = "ACCESSPOINTPASSWORD";
+#define STABLE 0
+#define REALISTIC 1
 
-//  variable declarations
-  int midPoint = 90;
-  float multiplier = 1.0;
-  float balance = 0.0;
-  int rangeMin = 0;
-  int rangeMax = 180;
-  int reactionSpeed = 100;
+int suspensionMode; // This will be loaded from Preferences
+float responseFactor = 0.5; // Default to a realistic response
+
+Preferences preferences; // Preferences object for non-volatile storage
+Servo fl, fr, rl, rr; // front-left, front-right, rear-left, rear-right
+
+int d[4]; // for storing angles in "degrees"
+int previousAngles[4] = {SERVO_MID, SERVO_MID, SERVO_MID, SERVO_MID}; // stores previous angles
+
+double acx, acy, acz; 
+
+// Calibration offsets
+double X_CAL, Y_CAL, Z_CAL;
+
+volatile bool mpuInterrupt = false; // flag to indicate MPU6050 data ready
+AsyncWebServer server(80); // Correct server type and port
+
+// Function declarations
+void w(uint8_t address, uint8_t value);
+void readAccelerometerData(int16_t &ax, int16_t &ay, int16_t &az);
+
+void IRAM_ATTR dmpDataReady() {
+  mpuInterrupt = true;
+}
+
+void loadPreferences() {
+  X_CAL = preferences.getDouble("X_CAL", 0.0);
+  Y_CAL = preferences.getDouble("Y_CAL", 0.0);
+  Z_CAL = preferences.getDouble("Z_CAL", 0.0);
+  suspensionMode = preferences.getInt("suspensionMode", REALISTIC); // Load the last used suspension mode
+}
+
+void savePreference(const char* key, double value) {
+  preferences.putDouble(key, value);
+}
+
+void saveIntPreference(const char* key, int value) {
+  preferences.putInt(key, value);
+}
 
 void setup() {
+  Serial.begin(115200);
 
-// Initialize serial communication
- Serial.begin(115200);
- delay(1000);
+  Wire.begin();
+  preferences.begin("suspension", false); // Initialize Preferences with namespace "suspension"
+  loadPreferences(); // Load saved preferences
 
-//  GPIO Designation
- frontLeftServo.attach(13);
- frontRightServo.attach(12);
- rearLeftServo.attach(14);
- rearRightServo.attach(27);
+  w(0x6b, 0x00); // disable MPU6050 sleep
+  w(0x1c, 0b00001000); // maximum accelerometer resolution
+  w(0x1a, 0b00000110); // filter setup
 
- preferences.begin("suspension", false);
- midPoint = preferences.getInt("midPoint", 90);
- multiplier = preferences.getFloat("multiplier", 1.0);
- balance = preferences.getFloat("balance", 0.0);
- rangeMin = preferences.getInt("rangeMin", 0);
- rangeMax = preferences.getInt("rangeMax", 180);
- reactionSpeed = preferences.getInt("reactionSpeed", 100);
+  rr.attach(2); // GPIO pins for the servos
+  fr.attach(3);
+  rl.attach(4);
+  fl.attach(5);
 
- // Set up WiFi as Access Point
- WiFi.mode(WIFI_AP_STA);
- WiFi.softAP(ssidAP, passwordAP);
+  // Attach interrupt for MPU6050 data ready
+  pinMode(21, INPUT_PULLUP); // Assume INT pin of MPU6050 is connected to GPIO 21
+  attachInterrupt(digitalPinToInterrupt(21), dmpDataReady, FALLING);
 
- // Print the IP address of the AP
- IPAddress apIP = WiFi.softAPIP();
- Serial.print("AP IP address: ");
- Serial.println(apIP);
+  // Wi-Fi setup
+  WiFi.softAP("ALVIN", "bluedaisy347");
+  Serial.println("WiFi AP started with SSID: ALVIN");
 
- // Setting up STA mode
- WiFi.begin(ssidSTA, passwordSTA);
+  // Global CORS configuration
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
 
- // Wait for STA connection
- Serial.println("Connecting to WiFi.");
- while (WiFi.status() != WL_CONNECTED) {
-  delay(1000);
-  Serial.println(".");
- }
- // Output STA IP address and hostname
- Serial.print("Connected to WiFi. IP address: ");
- Serial.println(WiFi.localIP());
- Serial.print("Hostname: ");
- Serial.println(WiFi.getHostname());
+  // Web server setup
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "Use the files on your phone to control the suspension.");
+  });
 
- // Define the root path handling function
- server.on("/", handleRoot);
- server.begin();
- Serial.println("HTTP server started");
+  // API to load settings
+  server.on("/api/load", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+    json += "\"X_CAL\":" + String(X_CAL) + ",";
+    json += "\"Y_CAL\":" + String(Y_CAL) + ",";
+    json += "\"Z_CAL\":" + String(Z_CAL) + ",";
+    json += "\"suspensionMode\":" + String(suspensionMode);
+    json += "}";
+    request->send(200, "application/json", json);
+  });
 
- webSocket.begin();
- webSocket.onEvent(webSocketEvent);
- Serial.println("WebSocket server started");
+  // API to save individual settings
+  server.on("/api/save", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("key") && request->hasParam("value")) {
+      String key = request->getParam("key")->value();
+      String valueStr = request->getParam("value")->value();
+
+      if (key == "suspensionMode") {
+        suspensionMode = valueStr.toInt();
+        saveIntPreference("suspensionMode", suspensionMode);
+      } else {
+        double value = valueStr.toDouble();
+        savePreference(key.c_str(), value);
+      }
+
+      loadPreferences(); // Reload preferences after saving
+      request->send(200, "text/plain", "OK");
+    } else {
+      request->send(400, "text/plain", "Missing parameters");
+    }
+  });
+
+  // API to load failsafe settings
+  server.on("/api/failsafe", HTTP_GET, [](AsyncWebServerRequest *request){
+    // Reset to default/failsafe settings
+    preferences.putDouble("X_CAL", 0.0);
+    preferences.putDouble("Y_CAL", 0.0);
+    preferences.putDouble("Z_CAL", 0.0);
+    preferences.putInt("suspensionMode", REALISTIC); // Default to realistic mode
+    loadPreferences(); // Reload preferences
+    request->send(200, "text/plain", "Failsafe settings loaded");
+  });
+
+  // API to reset MPU6050
+  server.on("/api/reset_mpu", HTTP_GET, [](AsyncWebServerRequest *request){
+    w(0x6b, 0x00); // Reset MPU6050
+    request->send(200, "text/plain", "MPU6050 reset");
+  });
+
+  server.begin(); // Start the server
+
+  // Dynamic calibration - read initial values
+  int16_t ax, ay, az;
+  readAccelerometerData(ax, ay, az);
+  X_CAL = ax / 819.2;
+  Y_CAL = ay / 819.2;
+  Z_CAL = az / 819.2;
 }
 
 void loop() {
- // Handle client requests
- server.handleClient();
- webSocket.loop();
+  if (mpuInterrupt) { // Check if MPU6050 data is ready
+    mpuInterrupt = false; // Reset interrupt flag
+
+    int16_t ax, ay, az;
+    readAccelerometerData(ax, ay, az);
+
+    acx = ax / 819.2 - X_CAL;
+    acy = ay / 819.2 - Y_CAL;
+    acz = az / 819.2 - Z_CAL;
+
+    Serial.print(acx);
+    Serial.print("   ");
+    Serial.print(acy);
+    Serial.print("   ");
+    Serial.print(acz);
+    Serial.println();
+
+    if (suspensionMode == STABLE) {
+      // Active suspension - car tries to counteract its inertia and compensate its angle
+      d[0] = SERVO_MID + (-acz + acy) * SCALE; // rr
+      d[1] = SERVO_MID + (acz + acy) * SCALE;  // fr
+      d[2] = SERVO_MID + (-acz - acy) * SCALE; // rl
+      d[3] = SERVO_MID + (acz - acy) * SCALE;  // fl
+    } else if (suspensionMode == REALISTIC) {
+      // More realistic simulation - allows some degree of rocking motion
+      d[0] = SERVO_MID + (-acz + acy) * SCALE * responseFactor; // rr
+      d[1] = SERVO_MID + (acz + acy) * SCALE * responseFactor;  // fr
+      d[2] = SERVO_MID + (-acz - acy) * SCALE * responseFactor; // rl
+      d[3] = SERVO_MID + (acz - acy) * SCALE * responseFactor;  // fl
+    }
+
+    wa(d);
+  }
 }
 
-void handleRoot() {
- String html = "<html><body>";
- html += "<h1>Suspension Control</h1>";
- html += "<form>";
- html += "Mid Point: <button onclick=\"updateValue('midPoint', -1)\" id=\"decrementMidPoint\">-</button>";
- html += "<input type=\"text\" id=\"midPoint\" value=\"" + String(midPoint) + "\" readonly>";
- html += "<button onclick=\"updateValue('midPoint', 1)\" id=\"incrementMidPoint\">+</button><br>";
- html += "Multiplier: <button onclick=\"updateValue('multiplier', -0.05)\" id=\"decrementMultiplier\">-</button>";
- html += "<input type=\"text\" id=\"multiplier\" value=\"" + String(multiplier) + "\" readonly>";
- html += "<button onclick=\"updateValue('multiplier', 0.05)\" id=\"incrementMultiplier\">+</button><br>";
- html += "Balance: <button onclick=\"updateValue('balance', -0.1)\" id=\"decrementBalance\">-</button>";
- html += "<input type=\"text\" id=\"balance\" value=\"" + String(balance) + "\" readonly>";
- html += "<button onclick=\"updateValue('balance', 0.1)\" id=\"incrementBalance\">+</button><br>";
- html += "Range Min: <button onclick=\"updateValue('rangeMin', -1)\" id=\"decrementRangeMin\">-</button>";
- html += "<input type=\"text\" id=\"rangeMin\" value=\"" + String(rangeMin) + "\" readonly>";
- html += "<button onclick=\"updateValue('rangeMin', 1)\" id=\"incrementRangeMin\">+</button><br>";
- html += "Range Max: <button onclick=\"updateValue('rangeMax', -1)\" id=\"decrementRangeMax\">-</button>";
- html += "<input type=\"text\" id=\"rangeMax\" value=\"" + String(rangeMax) + "\" readonly>";
- html += "<button onclick=\"updateValue('rangeMax', 1)\" id=\"incrementRangeMax\">+</button><br>";
- html += "Reaction Speed: <button onclick=\"updateValue('reactionSpeed', -10)\" id=\"decrementReactionSpeed\">-</button>";
- html += "<input type=\"text\" id=\"reactionSpeed\" value=\"" + String(reactionSpeed) + "\" readonly>";
- html += "<button onclick=\"updateValue('reactionSpeed', 10)\" id=\"incrementReactionSpeed\">+</button><br>";
- html += "</form>";
- html += "<script>";
- html += "var ws = new WebSocket('ws://' + location.hostname + ':81/');";
- html += "ws.onmessage = function(event) {";
- html += " var data = event.data.split(',');";
- html += " data.forEach(function(item) {";
- html += "  var pair = item.split(':');";
- html += "  var element = document.getElementById(pair[0]);";
- html += "  if (element) {";
- html += "   element.value = pair[1];";
- html += "   document.getElementById('decrement' + pair[0].charAt(0).toUpperCase() + pair[0].slice(1)).disabled = false;";
- html += "   document.getElementById('increment' + pair[0].charAt(0).toUpperCase() + pair[0].slice(1)).disabled = false;";
- html += "  } else {";
- html += "   console.error('Element not found: ' + pair[0]);";
- html += "  }";
- html += " });";
- html += "};";
- html += "function updateValue(id, increment) {";
- html += " var element = document.getElementById(id);";
- html += " var newValue = parseFloat(element.value) + increment;";
- html += " if (id === 'midPoint' || id === 'rangeMin' || id === 'rangeMax') {";
- html += "  newValue = Math.max(0, Math.min(180, newValue));";
- html += " } else if (id === 'multiplier') {";
- html += "  newValue = Math.max(0.05, Math.min(2.0, newValue));";
- html += " } else if (id === 'balance') {";
- html += "  newValue = Math.max(-1.0, Math.min(1.0, newValue));";
- html += " } else if (id === 'reactionSpeed') {";
- html += "  newValue = Math.max(10, Math.min(200, newValue));";
- html += " }";
- html += " element.value = newValue.toFixed(2);";
- html += " var message = id + ':' + newValue;";
- html += " ws.send(message);";
- html += " document.getElementById('decrement' + id.charAt(0).toUpperCase() + id.slice(1)).disabled = true;";
- html += " document.getElementById('increment' + id.charAt(0).toUpperCase() + id.slice(1)).disabled = true;";
- html += "}";
- html += "</script>";
- html += "</body></html>";
- server.send(200, "text/html", html);
+// Function to write byte to MPU6050
+void w(uint8_t address, uint8_t value) { 
+  Wire.beginTransmission(0x68);
+  Wire.write(address);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
+// Function to read accelerometer data
+void readAccelerometerData(int16_t &ax, int16_t &ay, int16_t &az) {
+  Wire.beginTransmission(0x68);
+  Wire.write(0x3B); // Starting register for accelerometer data
+  Wire.endTransmission(false);
+  Wire.requestFrom(0x68, 6, true);
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
- if (type == WStype_TEXT) {
-  String message = String((char *)payload);
-  Serial.print("Received message: ");
-  Serial.println(message);
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+}
 
-  // Split the message into key-value pairs
-  int start = 0;
-  int end = message.indexOf(',');
+// Function to write angles to servos, apply calibration and limit max points
+void wa(int d[]) { 
+  // FIRST - apply diagonal calibration
+  d[0] = d[0] - SERVO_DIFF;
+  d[1] = d[1] + SERVO_DIFF;
+  d[2] = d[2] + SERVO_DIFF;
+  d[3] = d[3] - SERVO_DIFF;
 
-  while (end != -1) {
-   String pair = message.substring(start, end);
-   int delimiter = pair.indexOf(':');
-   String key = pair.substring(0, delimiter);
-   String value = pair.substring(delimiter + 1);
-
-   Serial.print("Received key: ");
-   Serial.print(key);
-   Serial.print(", value: ");
-   Serial.println(value);
-
-   if (key == "midPoint") {
-    midPoint = value.toInt();
-    preferences.putInt("midPoint", midPoint);
-    Serial.println("midPoint updated");
-   } else if (key == "multiplier") {
-    multiplier = value.toFloat();
-    preferences.putFloat("multiplier", multiplier);
-    Serial.println("multiplier updated");
-   } else if (key == "balance") {
-    balance = value.toFloat();
-    preferences.putFloat("balance", balance);
-    Serial.println("balance updated");
-   } else if (key == "rangeMin") {
-    rangeMin = value.toInt();
-    preferences.putInt("rangeMin", rangeMin);
-    Serial.println("rangeMin updated");
-   } else if (key == "rangeMax") {
-    rangeMax = value.toInt();
-    preferences.putInt("rangeMax", rangeMax);
-    Serial.println("rangeMax updated");
-   } else if (key == "reactionSpeed") {
-    reactionSpeed = value.toInt();
-    preferences.putInt("reactionSpeed", reactionSpeed);
-    Serial.println("reactionSpeed updated");
-   }
-
-   start = end + 1;
-   end = message.indexOf(',', start);
+  // SECOND - remove overshoots
+  for (int i = 0; i < 4; i++) {
+    if (d[i] < SERVO_MIN) {
+      d[i] = SERVO_MIN;
+    } else if (d[i] > SERVO_MAX) {
+      d[i] = SERVO_MAX;
+    }
   }
 
-  // Handle the last key-value pair (or the only one if there is no comma)
-  String pair = message.substring(start);
-  int delimiter = pair.indexOf(':');
-  String key = pair.substring(0, delimiter);
-  String value = pair.substring(delimiter + 1);
-
-  Serial.print("Received key: ");
-  Serial.print(key);
-  Serial.print(", value: ");
-  Serial.println(value);
-
-  if (key == "midPoint") {
-   midPoint = value.toInt();
-   preferences.putInt("midPoint", midPoint);
-   Serial.println("midPoint updated");
-  } else if (key == "multiplier") {
-   multiplier = value.toFloat();
-   preferences.putFloat("multiplier", multiplier);
-   Serial.println("multiplier updated");
-  } else if (key == "balance") {
-   balance = value.toFloat();
-   preferences.putFloat("balance", balance);
-   Serial.println("balance updated");
-  } else if (key == "rangeMin") {
-   rangeMin = value.toInt();
-   preferences.putInt("rangeMin", rangeMin);
-   Serial.println("rangeMin updated");
-  } else if (key == "rangeMax") {
-   rangeMax = value.toInt();
-   preferences.putInt("rangeMax", rangeMax);
-   Serial.println("rangeMax updated");
-  } else if (key == "reactionSpeed") {
-   reactionSpeed = value.toInt();
-   preferences.putInt("reactionSpeed", reactionSpeed);
-   Serial.println("reactionSpeed updated");
+  // THIRD - check for significant change before updating servos
+  for (int i = 0; i < 4; i++) {
+    if (abs(d[i] - previousAngles[i]) >= ANGLE_THRESHOLD) {
+      // Invert angle if necessary
+      int servoAngle = (i == 0 || i == 3) ? 180 - d[i] : d[i];
+      
+      // Write to servo
+      switch (i) {
+        case 0: rr.write(servoAngle); break;
+        case 1: fr.write(servoAngle); break;
+        case 2: rl.write(servoAngle); break;
+        case 3: fl.write(servoAngle); break;
+      }
+      
+      previousAngles[i] = d[i];
+    }
   }
-
-  // Broadcast the updated values to all connected clients
-  webSocket.broadcastTXT(message);
- }
 }
