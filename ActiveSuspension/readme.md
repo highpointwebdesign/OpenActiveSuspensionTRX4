@@ -14,7 +14,7 @@ Preferences: Stores calibration offsets (X_CAL, Y_CAL, Z_CAL) and the suspension
 
 2. Suspension Modes:
 
-  STABLE Mode: The suspension actively counteracts the vehicle's inertia to maintain stability. The servos adjust their angles more aggressively to compensate for tilt.
+  STABLE Mode: The suspension actively counteracts the vehicle's inertia to maintain stability. The servos adjust their angles more aggressively to compensate for tilt.  
   REALISTIC Mode: Allows a more natural rocking motion, simulating a realistic suspension response with a less aggressive reaction.
 
 3. Web Server API:
